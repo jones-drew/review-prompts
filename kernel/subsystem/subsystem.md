@@ -23,7 +23,7 @@ regexes
 | Locking | spin_lock*, mutex_*, rwsem*, seqlock*, *seqcount* | locking.md |
 | Scheduler | kernel/sched/, sched_, schedule, *wakeup* | scheduler.md |
 | Timers | timer_list, timer_setup, mod_timer, del_timer, hrtimer, delayed_work | timers.md |
-| BPF | kernel/bpf/, tools/lib/bpf/, tools/testing/selftests/bpf, bpf, verifier | bpf.md |
+| BPF | kernel/bpf/, bpf, verifier | bpf.md |
 | RCU | rcu*, call_rcu, synchronize_rcu, kfree_rcu, kvfree_call_rcu | rcu.md |
 | Encryption | crypto, fscrypt_ | fscrypt.md |
 | Tracing | trace_, tracepoints | tracing.md |
@@ -54,6 +54,10 @@ regexes
 | Wireless/mac80211 | drivers/net/wireless/, net/mac80211/, BSS_CHANGED_, vif_cfg_changed, link_info_changed, bss_info_changed | wireless.md |
 | Selftests | tools/testing/selftests/, TEST_PROGS, TEST_FILES, TEST_GEN_FILES | selftests.md |
 | IRQ Chip | drivers/irqchip/, gic_, its_, irq_chip, irq_domain | irqchip.md |
+| IOMMU Core | drivers/iommu/, iommu_map, iommu_unmap, iommu_attach_device, iommu_domain_alloc, iommu_group, iommu_fwspec, iommu_iotlb_gather, pt_iommu, generic_pt | iommu.md |
+| RISC-V IOMMU | drivers/iommu/riscv/iommu.c, drivers/iommu/riscv/iommu.h, riscv_iommu_domain, riscv_iommu_device, riscv_iommu_iodir_update, riscv_iommu_cmd_send, riscv_iommu_gstage | riscv-iommu.md |
+| IRQ Bypass | virt/lib/irqbypass.c, irq_bypass_producer, irq_bypass_consumer, irq_bypass_register_producer, kvm_arch_has_irq_bypass, kvm_arch_update_irqfd_routing, irq_set_vcpu_affinity | irqbypass.md |
+| RISC-V IOMMU IRQ Bypass | drivers/iommu/riscv/iommu-ir.c, riscv_iommu_ir_, DOMAIN_BUS_MSI_REMAP, kvm_arch_irq_bypass, kvm_riscv_vcpu_irq_update, riscv_iommu_ir_vcpu_info, riscv_iommu_ir_chip_data | riscv-irqbypass.md |
 | CAN | drivers/net/can/, can_, canfd_, rcar_canfd, socketcan | can.md |
 | DT Bindings | Documentation/devicetree/bindings/, *.yaml in devicetree | dt-bindings.md |
 | USB Storage | drivers/usb/storage/, unusual_devs.h, UNUSUAL_DEV, USB_SC_, USB_PR_ | usb-storage.md |
