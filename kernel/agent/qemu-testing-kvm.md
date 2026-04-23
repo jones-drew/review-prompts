@@ -229,12 +229,31 @@ def check_guest_health(child, cfg=None):
     else:
         results.append('PASS: no guest call traces')
 
-    # WARNINGs (informational)
+    # Stack frames (RISC-V WARN() emits [<addr>] lines without "Call Trace:" header)
+    out = run(r'dmesg | grep -cE "\[<ffffffff"')
+    n = out.strip().splitlines()[-1].strip() if out.strip() else '0'
+    if n.isdigit() and int(n) > 0:
+        results.append(f'FAIL: {n} stack frame line(s) in guest dmesg')
+        passed = False
+    else:
+        results.append('PASS: no guest stack frames')
+
+    # Driver errors and probe failures
+    out = run(r'dmesg | grep -cE "error -E[A-Z]+:|probe with driver .* failed"')
+    n = out.strip().splitlines()[-1].strip() if out.strip() else '0'
+    if n.isdigit() and int(n) > 0:
+        results.append(f'FAIL: {n} driver error/probe failure line(s) in guest dmesg')
+        passed = False
+    else:
+        results.append('PASS: no guest driver errors or probe failures')
+
+    # WARNINGs
     if not cfg.get('skip_warning_check'):
         out = run('dmesg | grep -c "WARNING:"')
         n = out.strip().splitlines()[-1].strip() if out.strip() else '0'
         if n.isdigit() and int(n) > 0:
-            results.append(f'WARN: {n} WARNING(s) in guest dmesg')
+            results.append(f'FAIL: {n} WARNING(s) in guest dmesg')
+            passed = False
         else:
             results.append('PASS: no guest WARNINGs')
 
@@ -377,11 +396,30 @@ def check_dmesg_health(child, prompt, label, cfg, checks_key='dmesg_checks'):
     else:
         results.append(f'PASS: {label} no call traces')
 
+    # Stack frames (RISC-V WARN() emits [<addr>] lines without "Call Trace:" header)
+    out = run(r'dmesg | grep -cE "\[<ffffffff"')
+    n = out.strip().splitlines()[-1].strip() if out.strip() else '0'
+    if n.isdigit() and int(n) > 0:
+        results.append(f'FAIL: {label} {n} stack frame line(s)')
+        passed = False
+    else:
+        results.append(f'PASS: {label} no stack frames')
+
+    # Driver errors and probe failures
+    out = run(r'dmesg | grep -cE "error -E[A-Z]+:|probe with driver .* failed"')
+    n = out.strip().splitlines()[-1].strip() if out.strip() else '0'
+    if n.isdigit() and int(n) > 0:
+        results.append(f'FAIL: {label} {n} driver error/probe failure line(s)')
+        passed = False
+    else:
+        results.append(f'PASS: {label} no driver errors or probe failures')
+
     if not cfg.get('skip_warning_check'):
         out = run('dmesg | grep -c "WARNING:"')
         n = out.strip().splitlines()[-1].strip() if out.strip() else '0'
         if n.isdigit() and int(n) > 0:
-            results.append(f'WARN: {label} {n} WARNING(s)')
+            results.append(f'FAIL: {label} {n} WARNING(s)')
+            passed = False
         else:
             results.append(f'PASS: {label} no WARNINGs')
 

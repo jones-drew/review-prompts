@@ -218,7 +218,9 @@ def check_boot_health(child, prompt, cfg=None):
     else:
         results.append('PASS: no BUG/Oops/panic')
 
-    # 3. No call traces
+    # 3. No call traces / stack frames
+    # RISC-V WARN() emits [<addr>] stack frames without a "Call Trace:" header;
+    # check for both forms.
     out = run('dmesg | grep -c "Call Trace"')
     count = out.strip().splitlines()[-1].strip()
     if count.isdigit() and int(count) > 0:
@@ -227,17 +229,34 @@ def check_boot_health(child, prompt, cfg=None):
     else:
         results.append('PASS: no call traces')
 
-    # 4. No WARNING (optional — some are expected; caller can suppress)
+    out = run(r'dmesg | grep -cE "\[<ffffffff"')
+    count = out.strip().splitlines()[-1].strip()
+    if count.isdigit() and int(count) > 0:
+        results.append(f'FAIL: {count} stack frame line(s) in dmesg')
+        passed = False
+    else:
+        results.append('PASS: no stack frames')
+
+    # 4. No driver errors or probe failures
+    out = run(r'dmesg | grep -cE "error -E[A-Z]+:|probe with driver .* failed"')
+    count = out.strip().splitlines()[-1].strip()
+    if count.isdigit() and int(count) > 0:
+        results.append(f'FAIL: {count} driver error/probe failure line(s) in dmesg')
+        passed = False
+    else:
+        results.append('PASS: no driver errors or probe failures')
+
+    # 5. No WARNING (optional — some are expected; caller can suppress)
     if not (cfg or {}).get('skip_warning_check'):
         out = run('dmesg | grep -c "WARNING:"')
         count = out.strip().splitlines()[-1].strip()
         if count.isdigit() and int(count) > 0:
-            results.append(f'WARN: {count} WARNING(s) in dmesg (may be expected)')
-            # warnings are informational, not a hard failure
+            results.append(f'FAIL: {count} WARNING(s) in dmesg')
+            passed = False
         else:
             results.append('PASS: no WARNINGs')
 
-    # 5. Filesystem mounted (basic sanity)
+    # 6. Filesystem mounted (basic sanity)
     out = run('mount | grep -c "/"')
     count = out.strip().splitlines()[-1].strip()
     if count.isdigit() and int(count) > 0:
@@ -245,7 +264,7 @@ def check_boot_health(child, prompt, cfg=None):
     else:
         results.append('WARN: could not verify root filesystem mount')
 
-    # 6. Caller-specified dmesg patterns (optional)
+    # 7. Caller-specified dmesg patterns (optional)
     for label, pattern, must_match in (cfg or {}).get('dmesg_checks', []):
         out = run(f'dmesg | grep -c "{pattern}"')
         count_str = out.strip().splitlines()[-1].strip()
@@ -505,12 +524,31 @@ def check_boot_health(child, prompt, cfg=None):
     else:
         results.append('PASS: no call traces')
 
-    # WARNINGs (informational)
+    # Stack frames (RISC-V WARN() emits [<addr>] lines without "Call Trace:" header)
+    out = run(r'dmesg | grep -cE "\[<ffffffff"')
+    n = out.strip().splitlines()[-1].strip() if out.strip() else '0'
+    if n.isdigit() and int(n) > 0:
+        results.append(f'FAIL: {n} stack frame line(s) in dmesg')
+        passed = False
+    else:
+        results.append('PASS: no stack frames')
+
+    # Driver errors and probe failures
+    out = run(r'dmesg | grep -cE "error -E[A-Z]+:|probe with driver .* failed"')
+    n = out.strip().splitlines()[-1].strip() if out.strip() else '0'
+    if n.isdigit() and int(n) > 0:
+        results.append(f'FAIL: {n} driver error/probe failure line(s) in dmesg')
+        passed = False
+    else:
+        results.append('PASS: no driver errors or probe failures')
+
+    # WARNINGs
     if not cfg.get('skip_warning_check'):
         out = run('dmesg | grep -c "WARNING:"')
         n = out.strip().splitlines()[-1].strip() if out.strip() else '0'
         if n.isdigit() and int(n) > 0:
-            results.append(f'WARN: {n} WARNING(s) in dmesg')
+            results.append(f'FAIL: {n} WARNING(s) in dmesg')
+            passed = False
         else:
             results.append('PASS: no WARNINGs')
 
@@ -681,6 +719,8 @@ Boot test: PASS / FAIL
   Kernel: <uname -a output>
   BUG/Oops/panic: none / <details>
   Call traces: none / N found
+  Stack frames: none / N found
+  Driver errors/probe failures: none / N found
   WARNINGs: none / N found
   <additional dmesg checks and results>
 Console log: /tmp/qemu_console.log
