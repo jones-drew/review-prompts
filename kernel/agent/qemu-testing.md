@@ -256,7 +256,33 @@ def check_boot_health(child, prompt, cfg=None):
         else:
             results.append('PASS: no WARNINGs')
 
-    # 6. Filesystem mounted (basic sanity)
+
+    # 6. Broad error/warning/failure scan with false-positive filtering
+    #
+    # Scan for any dmesg line containing error, warn(ing), or fail(ed) and
+    # filter out known-benign patterns in Python rather than via shell grep,
+    # to avoid the filter pattern itself appearing in the output.
+    #
+    # Known false positives (buildroot + RISC-V QEMU):
+    #   - EXT4 unchecked fs warning (rootfs not e2fsck'd)
+    #   - ip: SIOCGIFFLAGS (kvmtool virtio-net before interface is up)
+    DMESG_FP = [
+        'EXT4-fs',       # unchecked fs warning
+        'SIOCGIFFLAGS',  # net interface not up yet
+    ]
+    out = run(r'dmesg | grep -iE "\berror\b|\bwarn(ing)?\b|\bfail(ed)?\b"')
+    broad_hits = [l.strip() for l in out.splitlines()
+                  if l.strip() and 'grep' not in l
+                  and not any(fp in l for fp in DMESG_FP)]
+    if broad_hits:
+        results.append(f'FAIL: {len(broad_hits)} unexpected error/warn/fail line(s) in dmesg:')
+        for b in broad_hits[:10]:
+            results.append(f'  {b}')
+        passed = False
+    else:
+        results.append('PASS: no unexpected errors/warnings/failures in dmesg')
+
+    # 7. Filesystem mounted (basic sanity)
     out = run('mount | grep -c "/"')
     count = out.strip().splitlines()[-1].strip()
     if count.isdigit() and int(count) > 0:
@@ -264,7 +290,7 @@ def check_boot_health(child, prompt, cfg=None):
     else:
         results.append('WARN: could not verify root filesystem mount')
 
-    # 7. Caller-specified dmesg patterns (optional)
+    # 8. Caller-specified dmesg patterns (optional)
     for label, pattern, must_match in (cfg or {}).get('dmesg_checks', []):
         out = run(f'dmesg | grep -c "{pattern}"')
         count_str = out.strip().splitlines()[-1].strip()
@@ -552,6 +578,31 @@ def check_boot_health(child, prompt, cfg=None):
         else:
             results.append('PASS: no WARNINGs')
 
+    # Broad error/warning/failure scan with false-positive filtering
+    #
+    # Scan for any dmesg line containing error, warn(ing), or fail(ed) and
+    # filter out known-benign patterns in Python rather than via shell grep,
+    # to avoid the filter pattern itself appearing in the output.
+    #
+    # Known false positives (buildroot + RISC-V QEMU):
+    #   - EXT4 unchecked fs warning (rootfs not e2fsck'd)
+    #   - ip: SIOCGIFFLAGS (kvmtool virtio-net before interface is up)
+    DMESG_FP = [
+        'EXT4-fs',       # unchecked fs warning
+        'SIOCGIFFLAGS',  # net interface not up yet
+    ]
+    out = run(r'dmesg | grep -iE "\berror\b|\bwarn(ing)?\b|\bfail(ed)?\b"')
+    broad_hits = [l.strip() for l in out.splitlines()
+                  if l.strip() and 'grep' not in l
+                  and not any(fp in l for fp in DMESG_FP)]
+    if broad_hits:
+        results.append(f'FAIL: {len(broad_hits)} unexpected error/warn/fail line(s) in dmesg:')
+        for b in broad_hits[:10]:
+            results.append(f'  {b}')
+        passed = False
+    else:
+        results.append('PASS: no unexpected errors/warnings/failures in dmesg')
+
     # Caller-specified dmesg checks
     for label, pattern, must_match in cfg.get('dmesg_checks', []):
         out = run(f'dmesg | grep -c "{pattern}"')
@@ -694,6 +745,28 @@ Use `scripts/config --file build/.config -m SYMBOL` to set a symbol to
 module, `-e SYMBOL` to enable as builtin, `-d SYMBOL` to disable.
 Always follow with `make ... olddefconfig` to resolve dependencies.
 
+
+## Updating Test Scripts
+
+**Always follow this process when modifying test behaviour:**
+
+1. **Delete** the existing test script(s) — never patch them directly.
+   The scripts are generated artifacts; patching them creates drift from
+   the agent templates and makes future regeneration unreliable.
+   ```bash
+   rm boot_test.py kvm_boot_test.py   # or whichever scripts are affected
+   ```
+
+2. **Update the agent** (`qemu-testing.md` and/or `qemu-testing-kvm.md`)
+   with the correct logic — fix the template `check_boot_health` /
+   `check_dmesg_health` function, the cfg defaults, or the dmesg check
+   lists as needed.
+
+3. **Regenerate the scripts** by following the Task section below,
+   filling in the cfg dict from the environment.
+
+This ensures the agent templates and the running scripts are always in
+sync. Never accumulate hand-patches in the scripts.
 
 ## Task
 
