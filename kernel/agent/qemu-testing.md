@@ -327,7 +327,19 @@ after boot. This requires the guest rootfs to have `sshd` installed.
 import os
 
 def setup_ssh(child, prompt, ssh_port=9997):
-    """Install caller's pubkey and start sshd. Returns SSH command string."""
+    """
+    Install caller's pubkey and start sshd. Returns SSH command string.
+
+    Buildroot notes:
+    - buildroot already starts sshd at boot; kill it first to avoid
+      "address already in use" when starting a new instance with our options.
+    - sshd must be invoked with its full path (/usr/sbin/sshd) — bare 'sshd'
+      fails with "sshd requires execution with an absolute path".
+    - Long command lines get truncated by the PTY line width; keep each
+      sendline call short or split across multiple calls.
+    - pgrep is not available in buildroot; use ps + grep + awk to find PIDs.
+    - Verify SSH works with a test command before returning.
+    """
     pubkey_path = os.path.expanduser('~/.ssh/id_ed25519.pub')
     if not os.path.exists(pubkey_path):
         raise RuntimeError(f'No SSH public key at {pubkey_path}')
@@ -339,17 +351,28 @@ def setup_ssh(child, prompt, ssh_port=9997):
     child.expect(prompt, timeout=10)
     child.sendline('chmod 600 /root/.ssh/authorized_keys')
     child.expect(prompt, timeout=10)
-    child.sendline(
-        'sshd -o PermitRootLogin=yes -o PasswordAuthentication=no '
-        '-o StrictModes=no 2>/dev/null &'
-    )
+    # Kill any existing sshd (buildroot starts one at boot)
+    child.sendline('killall sshd 2>/dev/null')
+    child.expect(prompt, timeout=5)
+    # Use full path — bare 'sshd' fails in buildroot
+    child.sendline('/usr/sbin/sshd -o PermitRootLogin=yes '
+                   '-o PasswordAuthentication=no -o StrictModes=no &')
     child.expect(prompt, timeout=10)
     import time; time.sleep(2)
 
-    return (
+    ssh_cmd = (
         f'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null '
         f'-o ConnectTimeout=10 -i ~/.ssh/id_ed25519 -p {ssh_port} root@localhost'
     )
+
+    # Verify SSH is working before returning
+    import subprocess
+    r = subprocess.run(ssh_cmd.split() + ['echo ok'],
+                       capture_output=True, text=True, timeout=10)
+    if r.returncode != 0 or 'ok' not in r.stdout:
+        raise RuntimeError(f'SSH verification failed: {r.stderr.strip()[:80]}')
+
+    return ssh_cmd
 
 def open_ssh_session(ssh_cmd, label='ssh', timeout=30):
     ssh = pexpect.spawn(

@@ -145,6 +145,70 @@ Or add `p9 /share 9p trans=virtio,version=9p2000.L,cache=loose 0 0` to
 `/etc/fstab` in the rootfs. In the standard buildroot image the share is
 auto-mounted at boot via an init script — verify with `ls /share/bin/`.
 
+## Buildroot SSH Pitfalls
+
+When setting up SSH on a buildroot guest for multi-session tests, several
+non-obvious issues arise:
+
+**1. Use the full sshd path**
+
+Buildroot's sshd requires an absolute path. Bare `sshd` fails:
+```
+sshd requires execution with an absolute path
+```
+Always use `/usr/sbin/sshd`.
+
+**2. Kill the existing sshd first**
+
+Buildroot starts sshd at boot. Starting a second instance fails with
+"address already in use". Kill the existing one first:
+```python
+child.sendline('killall sshd 2>/dev/null')
+child.expect(prompt, timeout=5)
+child.sendline('/usr/sbin/sshd -o PermitRootLogin=yes '
+               '-o PasswordAuthentication=no -o StrictModes=no &')
+child.expect(prompt, timeout=5)
+time.sleep(2)
+```
+
+**3. Keep sendline commands short**
+
+Long command lines get truncated by the PTY line width, causing the shell
+to receive a broken command. Split long commands across multiple sendline
+calls rather than chaining with `;` into one long line.
+
+**4. pgrep and pkill are not available in buildroot**
+
+Use `killall` to kill by name, `ps | grep | awk` to find PIDs:
+```python
+# Find kvmtool PID — pgrep not available in buildroot
+r = ssh("ps | grep lkvm-static | grep -v grep | awk '{ print $1 }'")
+```
+
+**5. Retry SSH connection with backoff**
+
+SSH may not be ready immediately after sshd starts. Retry with a delay:
+```python
+pid = None
+for attempt in range(8):
+    time.sleep(2)
+    r = ssh("ps | grep lkvm-static | grep -v grep | awk '{ print $1 }'")
+    if r.returncode == 0 and r.stdout.strip():
+        pid = r.stdout.strip().split()[0]
+        break
+```
+
+**6. Verify SSH works before proceeding**
+
+After setup, verify with a test command before relying on SSH:
+```python
+r = subprocess.run(['ssh', ...args..., 'echo ok'],
+                   capture_output=True, text=True, timeout=10)
+if r.returncode != 0 or 'ok' not in r.stdout:
+    log(f'SSH not ready: {r.stderr.strip()[:80]}')
+    return False
+```
+
 ## pexpect Session Structure
 
 The guest runs in the foreground of the host console pexpect session.
