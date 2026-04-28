@@ -5,7 +5,7 @@ Load `iommu.md` first for generic IOMMU framework knowledge. This file covers
 `drivers/iommu/riscv/iommu-bits.h`, and the RISC-V IOMMU hardware interface.
 It does not cover interrupt remapping (irqbypass) — see `riscv-irqbypass.md`.
 
-Baseline: `riscv/iommu-irqbypass-rfc-v3-rc3`.
+Baseline: `riscv/iommu-irqbypass-rfc-v3-rc4`.
 
 ## Device Context Table (DDT) and Device Contexts
 
@@ -178,8 +178,16 @@ Sv48x4.  Full coverage up to the hardware's 41-bit / 50-bit GPA limit
 would require implementing the SV*x4 wider root page table.
 
 **REPORT as bugs**: `iommu_map(&domain->domain, ...)` calls in code that
-intends to map IMSIC addresses for MSI translation — these map into the
-s-stage and have no effect on MSI lookup. Use `riscv_iommu_gstage_map()`.
+intends to update the g-stage DMA identity table directly — these map into
+the s-stage and have no effect on the g-stage.  G-stage DMA identity mappings
+are installed automatically by the `gstage_install_ops()` wrapper on every
+s-stage `iommu_map()` call; never call `iommu_map` expecting a g-stage effect.
+
+Note: IMSIC identity mappings for MSI table lookup are correctly placed in
+the **s-stage** via `iommu_map(&domain->domain, addr, addr, ...)` by
+`riscv_iommu_ir_map_imsics()`.  This is intentional and correct — the s-stage
+must not fault on MSI writes before the hardware consults the MSI table.  Do
+not move these to the g-stage.
 
 ## unmap_range and g-stage Ordering
 
@@ -297,3 +305,17 @@ addresses are handled separately via the explicit s-stage map.
   mappings are managed dynamically because guest IMSIC GPAs may differ
   from host IMSIC physical addresses). See `iommu.md` for full detail
   on reserved region types.
+
+## Error Path Discipline
+
+Forgetting to sync the IOTLB gather after an unmap in an error path leaves
+stale IOTLB entries that can cause devices to access freed memory.
+
+In `riscv_iommu_gstage_map_range()`, the g-stage `map_range` failure path
+calls `domain->saved_pt_ops->unmap_range(...)` to undo the s-stage mapping
+and passes an `iommu_iotlb_gather` to collect the range.  The gather must be
+synced with `iommu_tlb_sync(&domain->domain, &gather)` after the unmap;
+without this call, the IOTLB is not invalidated for the rolled-back range.
+
+**REPORT as bugs**: `unmap_range()` calls in error paths that initialise an
+`iommu_iotlb_gather` but never call `iommu_tlb_sync()` on it.

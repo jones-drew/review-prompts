@@ -105,6 +105,16 @@ before calling `kvm_arch_update_irqfd_routing()`. Any lock taken inside
 after `irqfds.lock` in all code paths. Acquiring `irqfds.lock` while
 holding such a lock is an ABBA deadlock.
 
+**`kvm_arch_update_irqfd_routing()` runs in spinlock context**: it is called
+with `irqfds.lock` held via `spin_lock_irq`, meaning IRQs are disabled and
+preemption is off.  On PREEMPT_RT, `spinlock_t` is a sleeping lock; calling
+any function that acquires a regular `spinlock_t` internally (including
+`iommu_map()`, mutex operations, or most allocations) is an RT violation.
+arm64 documents this explicitly: "We're in spinlock land at this point, so no
+chance of resolving the translation" and falls back to software injection.
+Any new arch implementation that cannot complete the routing update in atomic
+context **must** implement a fallback to software interrupt delivery.
+
 ## irq_set_vcpu_affinity() and the NULL Convention
 
 `irq_set_vcpu_affinity(irq, vcpu_info)` programs the IRQ chip to deliver

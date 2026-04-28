@@ -5,7 +5,7 @@ Load `iommu.md`, `riscv-iommu.md`, and `irqbypass.md` first. This file covers
 `arch/riscv/kvm/aia_imsic.c`, and the MSI domain stacking infrastructure
 specific to RISC-V IOMMU interrupt remapping.
 
-Baseline: `riscv/iommu-irqbypass-rfc-v3-rc3`.
+Baseline: `riscv/iommu-irqbypass-rfc-v3-rc4`.
 
 ## MSI Domain Stacking
 
@@ -146,9 +146,14 @@ cannot be called while the lock is held.
 
 ### kvm_arch_update_irqfd_routing()
 
-- Guards: `if (!irqfd->producer) return` at entry; returns early when old
-  and new MSI messages are identical; returns early when
-  `new->type != KVM_IRQ_ROUTING_MSI`.
+- The KVM core guards the call with `if (irqfd->producer)` before invoking
+  this function.  The rc4 implementation relies on that guarantee and accesses
+  `irqfd->producer->irq` directly at function entry — there is no redundant
+  null-check inside the function.  This is safe but fragile; defensive callers
+  should document the KVM-core invariant.
+- Must return early when old and new MSI messages are identical — avoid
+  unnecessary IOMMU table updates.
+- Any lock acquired inside must be lower in the hierarchy than `irqfds.lock`.
 - Reads `vcpu->arch.aia_context.imsic_addr` without a lock. This is safe
   because `imsic_addr` is set once at AIA device configuration time and
   never changes. A comment explaining this invariant is needed.
@@ -162,6 +167,21 @@ cannot be called while the lock is held.
 - Holds `vsfile_lock(read)` around the `irq_set_vcpu_affinity()` and
   `irq_write_msi_msg()` calls to ensure `imsic->vsfile_pa` is stable.
 
+**PREEMPT_RT concern**: `kvm_arch_update_irqfd_routing()` is called with
+`irqfds.lock` held via `spin_lock_irq` (IRQs disabled).  On PREEMPT_RT,
+`spinlock_t` is an `rt_mutex` and is therefore a sleeping lock.  The call
+chain `irq_set_vcpu_affinity()` → `riscv_iommu_ir_irq_set_vcpu_affinity()` →
+`riscv_iommu_ir_vcpu_new_config()` → `iommu_map()` acquires PT `spinlock_t`
+internals.  On PREEMPT_RT, this is a sleeping call inside an IRQ-disabled
+context — a kernel correctness violation.  arm64 avoids this by falling back
+to software injection when it detects spinlock context; RISC-V needs an
+equivalent fallback for the topology-change path.  The fast path (same
+topology, PTE update only under `raw_spinlock`) is unaffected.
+
+**REPORT as bugs**: implementations that call `iommu_map()` (or any function
+that acquires a regular `spinlock_t`) from inside `kvm_arch_update_irqfd_routing()`
+or `__kvm_riscv_vcpu_irq_update()` on PREEMPT_RT kernels.
+
 ### kvm_riscv_vcpu_irq_update()
 
 Called from `kvm_riscv_vcpu_aia_imsic_update()` **after**
@@ -173,6 +193,12 @@ acquiring `vsfile_lock(read)`.
 - Acquires `irqfds.lock` internally to iterate `kvm->irqfds.items`.
 - Breaks on any non-zero return from `irq_set_vcpu_affinity()`, with
   `WARN_ON_ONCE` for non-EOPNOTSUPP errors.
+
+**REPORT as bugs**: `__kvm_riscv_vcpu_irq_update()` breaking out of the
+irqfd loop on the first failure.  After a vCPU migration, if one device's
+`irq_set_vcpu_affinity()` fails, the remaining irqfds in the VM still point
+to the old VS-file.  The loop should continue and log each failure rather than
+aborting early.
 
 **REPORT as bugs**: any code path that acquires `irqfds.lock` while holding
 `vsfile_lock`, or acquires `vsfile_lock` while holding `irqfds.lock`.
@@ -204,18 +230,36 @@ addresses are handled separately via this explicit s-stage map.
 addresses — that would map into the g-stage and have no effect on MSI
 lookup.
 
-## Open Issues in v3-rc3
+## Open Issues in v3-rc4
+
+- **PREEMPT_RT: `iommu_map()` in spinlock context**: `kvm_arch_update_irqfd_routing()`
+  and `__kvm_riscv_vcpu_irq_update()` call `irq_set_vcpu_affinity()` which on
+  topology change calls `iommu_map()` while `irqfds.lock` is held with
+  `spin_lock_irq` (IRQs disabled).  On PREEMPT_RT, `iommu_map()` acquires
+  sleeping locks.  Needs a fallback for the new-topology path.
+
+- **NULL-deref in `riscv_iommu_ir_irq_domain_alloc_irqs()`**: `info->domain`
+  is accessed without a null-check.  `info->domain` is NULL from probe until
+  first domain attach.  If IRQ allocation somehow occurs before domain attach
+  the driver crashes.  Add a guard: `if (!info->domain) return -ENODEV`.
+
+- **irqfd loop breaks on first failure**: `__kvm_riscv_vcpu_irq_update()`
+  breaks on the first `irq_set_vcpu_affinity()` failure, leaving remaining
+  devices with stale PTE entries after vCPU migration.  The loop should
+  continue and log each failure.
 
 - **`irqfds.lock` in add_producer**: `kvm_arch_irq_bypass_add_producer()`
   assigns `irqfd->producer` and calls `kvm_arch_update_irqfd_routing()`
   without holding `irqfds.lock`. The specific complication is that
   `kvm_riscv_vcpu_irq_update()` acquires `irqfds.lock` internally, so it
-  cannot be called while the lock is held. See `irqbypass.md` for the
+  cannot be called while the lock is held.  See `irqbypass.md` for the
   general constraint.
-- **`stop`/`start` callbacks**: not implemented; weak no-ops used. The
+
+- **`stop`/`start` callbacks**: not implemented; weak no-ops used.  The
   IOMMU MSI table update is serialised by `IOFENCE.C` inside
   `riscv_iommu_ir_msitbl_inval()`, which may be sufficient — needs
   confirmation from the spec.
+
 - **`imsic_addr` invariant comment**: the lockless read of
   `vcpu->arch.aia_context.imsic_addr` in `kvm_arch_update_irqfd_routing()`
   needs a comment explaining that `imsic_addr` is set once at AIA device
