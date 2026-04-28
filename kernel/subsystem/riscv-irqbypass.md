@@ -5,7 +5,7 @@ Load `iommu.md`, `riscv-iommu.md`, and `irqbypass.md` first. This file covers
 `arch/riscv/kvm/aia_imsic.c`, and the MSI domain stacking infrastructure
 specific to RISC-V IOMMU interrupt remapping.
 
-Baseline: `riscv/iommu-irqbypass-rfc-v3-rc4`.
+Baseline: `riscv/iommu-irqbypass-rfc-v3-rc5` (major redesign from rc4).
 
 ## MSI Domain Stacking
 
@@ -41,13 +41,13 @@ fn = info->irqdomain->fwnode;   // save before remove
 irq_domain_remove(info->irqdomain);
 info->irqdomain = NULL;
 irq_domain_free_fwnode(fn);     // free after remove
+dev_set_msi_domain(dev, parent); // restore parent domain
 ```
 
 `riscv_iommu_ir_irq_domain_remove()` is called from both
-`riscv_iommu_probe_device()` error paths (where `info->domain` is NULL) and
-`riscv_iommu_release_device()` (where `info->domain` may be NULL for devices
-never attached to a paging domain). All call sites guard with `if (domain)`
-before calling `riscv_iommu_ir_free_msi_table(domain)`.
+`riscv_iommu_probe_device()` error paths and
+`riscv_iommu_release_device()`. All call sites that free the MSI table guard
+with `if (domain)` before calling `riscv_iommu_ir_free_msi_table(domain)`.
 
 ## MSI Table Setup and the One-Time Init Sentinel
 
@@ -58,17 +58,18 @@ topology fields (`msi_addr_mask`, `msi_addr_pattern`, `group_index_bits`,
 `group_index_shift`, `imsic_stride`, `msi_root`, `msi_pte_counts`) are
 initialised.
 
-- `msi_root` is only allocated when `RISCV_IOMMU_CAPABILITIES_MSI_FLAT` is
-  set. On base-format hardware `msi_root` stays NULL even after first attach.
+- `msi_root` is allocated on first attach for MSI_FLAT + imsic_enabled()
+  domains. If `imsic_get_global_config()` returns NULL (no IMSIC), no MSI
+  table is allocated and `msi_root` stays NULL.
 - `msi_lock` must be `raw_spinlock_t` because `irq_set_vcpu_affinity()` is
   called from KVM with IRQs disabled (atomic context).
 - `msitbl_config` is a generation counter incremented on every full MSI table
   reconfiguration. IRQs store their config generation at alloc time; at free
   time only IRQs whose stored config matches `domain->msitbl_config` need
   explicit unmapping — stale IRQs from a previous config were already cleared.
-- `riscv_iommu_gstage_best_mode()` must return non-zero before allocating
-  the MSI table. If `MSI_FLAT` is set but no SV*x4 g-stage mode is available,
-  the hardware is non-compliant; the driver warns and skips MSI table setup.
+- `riscv_iommu_gstage_best_mode()` is no longer used — the SV*x4 mode is
+  selected at domain allocation time and the GSCID is pre-allocated. There is
+  no longer a separate g-stage page table to initialise on first attach.
 
 ## IOTINVAL.GVMA Address Field
 
@@ -123,6 +124,48 @@ the lock serialises the 0→1 transition and the PTE write. Calling
 via `readx_poll_timeout`) while holding `raw_spinlock_irqsave` is safe
 because no sleeping occurs.
 
+## riscv_iommu_ir_irq_set_vcpu_affinity() — New Design (rc5)
+
+`riscv_iommu_ir_irq_set_vcpu_affinity()` is the core irqbypass hook. It
+directly manipulates the MSI table PTEs under `raw_spinlock_t msi_lock`
+without calling `iommu_map()`. This avoids the PREEMPT_RT violation that
+existed in earlier revisions.
+
+**NULL vcpu_info means remove the mapping** (revert to host delivery):
+```c
+riscv_iommu_ir_msitbl_unmap(domain, data, old_idx);
+```
+
+**Config mismatch (new IMSIC topology)**:  calls
+`riscv_iommu_ir_vcpu_new_config()`, which:
+1. Calls `riscv_iommu_ir_msitbl_clear()` — zeroes all PTEs and refcounts.
+2. Updates topology fields (`msi_addr_mask`, `msi_addr_pattern`,
+   `group_index_bits`, `group_index_shift`).
+3. Increments `msitbl_config` (generation counter).
+4. Writes the new PTE directly to `domain->msi_root[idx]`.
+5. Issues `riscv_iommu_ir_msitbl_inval_all()` — IOTINVAL.GVMA broadcast.
+6. Sets `msi_pte_counts[idx] = 1`.
+7. Calls `riscv_iommu_ir_msiptp_update()` to update all DCs via
+   `riscv_iommu_iodir_update()`. This is called from `irq_set_vcpu_affinity()`
+   which runs under `irqfds.lock` (IRQs disabled). `riscv_iommu_iodir_update()`
+   uses only `readx_poll_timeout` (busy-wait), not sleeping locks — RT-safe.
+
+**Config match, fast path** (same IMSIC topology, possibly different slot):
+Holds `raw_spinlock` (not irqsave — caller already has IRQs disabled):
+1. Computes new PTE value and writes if changed; issues IOTINVAL.GVMA.
+2. If `old_config != msitbl_config` (IRQ survived a config change): bump
+   refcount on new slot only.
+3. If `new_idx != old_idx` (slot change): dec old refcount (freeing PTE if
+   zero), inc new refcount.
+
+**PREEMPT_RT status**: The fast path uses `raw_spinlock_t` (RT-safe) and
+`readx_poll_timeout` (busy-wait, RT-safe). The topology-change path calls
+`riscv_iommu_iodir_update()` which busy-waits via `readx_poll_timeout` but
+does not acquire sleeping locks. This path is called under `irqfds.lock`
+(`spin_lock_irq`). On PREEMPT_RT `spinlock_t` is a sleeping lock; confirm
+that `riscv_iommu_iodir_update()` acquires no spinlock_t internally before
+marking RT-safe.
+
 ## KVM Consumer: vm.c and aia_imsic.c
 
 ### kvm_arch_has_irq_bypass()
@@ -130,59 +173,63 @@ because no sleeping occurs.
 Returns `imsic_enabled()`. This correctly gates bypass on IMSIC being
 present and in hardware acceleration mode. Do not change to unconditional
 `true` — that would register consumers on systems without IMSIC or in AIA
-emulation mode.  `imsic_enabled()` encapsulates the `imsic_get_global_config()`
-and hardware-mode checks internally.
+emulation mode.
 
 ### kvm_arch_irq_bypass_add_producer()
 
 Returns early when `kvm->arch.aia.mode == KVM_DEV_RISCV_AIA_MODE_EMUL` —
 no VS-files available in emulation mode, bypass cannot work.
 
-**Open**: Does not hold `irqfds.lock` around the `irqfd->producer`
-assignment and the `kvm_arch_update_irqfd_routing()` call. See `irqbypass.md`
-for the general constraint. The specific complication on RISC-V is that
-`kvm_riscv_vcpu_irq_update()` acquires `irqfds.lock` internally, so it
-cannot be called while the lock is held.
+Assigns `irqfd->producer = prod` then calls
+`kvm_arch_update_irqfd_routing(irqfd, NULL, &irqfd->irq_entry)`. Does not
+hold `irqfds.lock` — the specific complication is that
+`__kvm_riscv_vcpu_irq_update()` acquires `irqfds.lock` internally, so it
+cannot be called while the lock is held. See `irqbypass.md` for the general
+constraint.
+
+### kvm_arch_irq_bypass_del_producer()
+
+Implemented in rc5. Calls
+`kvm_arch_update_irqfd_routing(irqfd, &irqfd->irq_entry, NULL)` before
+clearing `irqfd->producer = NULL`. This ensures the IOMMU MSI table entry
+is removed before the producer reference is dropped.
 
 ### kvm_arch_update_irqfd_routing()
 
-- The KVM core guards the call with `if (irqfd->producer)` before invoking
-  this function.  The rc4 implementation relies on that guarantee and accesses
-  `irqfd->producer->irq` directly at function entry — there is no redundant
-  null-check inside the function.  This is safe but fragile; defensive callers
-  should document the KVM-core invariant.
-- Must return early when old and new MSI messages are identical — avoid
+- Called from both `kvm_arch_irq_bypass_add_producer()` (not under
+  `irqfds.lock`) and `kvm_irq_routing_update()` (under `irqfds.lock`).
+- Returns early when old and new MSI messages are identical — avoid
   unnecessary IOMMU table updates.
-- Any lock acquired inside must be lower in the hierarchy than `irqfds.lock`.
+- Returns early when `!new` (del_producer path): calls
+  `irq_set_vcpu_affinity(host_irq, NULL)` to remove the MSI table mapping.
+- Returns early when `new->type != KVM_IRQ_ROUTING_MSI`.
+- Iterates `kvm_for_each_vcpu` to find the vCPU whose `imsic_addr` matches
+  the MSI target address. Returns if no match (device not routing to a vCPU).
 - Reads `vcpu->arch.aia_context.imsic_addr` without a lock. This is safe
   because `imsic_addr` is set once at AIA device configuration time and
-  never changes. A comment explaining this invariant is needed.
-- Calls `irq_set_vcpu_affinity(host_irq, &vcpu_info)` to populate the IOMMU
-  MSI table entry mapping the guest IMSIC GPA to the host VS-file HPA.
-- Calls `irq_write_msi_msg()` after a successful `irq_set_vcpu_affinity()`.
-  This reprograms the device MSI target address to point at the guest VS-file
-  GPA directly. This is intentional: the device targets the guest GPA; the
-  IOMMU MSI table maps guest GPA → host VS-file HPA. Neither x86 nor arm64
-  does this — it is a RISC-V-specific design that needs a comment.
-- Holds `vsfile_lock(read)` around the `irq_set_vcpu_affinity()` and
-  `irq_write_msi_msg()` calls to ensure `imsic->vsfile_pa` is stable.
+  never changes.
 
-**PREEMPT_RT concern**: `kvm_arch_update_irqfd_routing()` is called with
-`irqfds.lock` held via `spin_lock_irq` (IRQs disabled).  On PREEMPT_RT,
-`spinlock_t` is an `rt_mutex` and is therefore a sleeping lock.  The call
-chain `irq_set_vcpu_affinity()` → `riscv_iommu_ir_irq_set_vcpu_affinity()` →
-`riscv_iommu_ir_vcpu_new_config()` → `iommu_map()` acquires PT `spinlock_t`
-internals.  On PREEMPT_RT, this is a sleeping call inside an IRQ-disabled
-context — a kernel correctness violation.  arm64 avoids this by falling back
-to software injection when it detects spinlock context; RISC-V needs an
-equivalent fallback for the topology-change path.  The fast path (same
-topology, PTE update only under `raw_spinlock`) is unaffected.
+  **Missing comment**: the lockless `imsic_addr` read needs a comment
+  explaining this invariant. Flag if absent.
 
-**REPORT as bugs**: implementations that call `iommu_map()` (or any function
-that acquires a regular `spinlock_t`) from inside `kvm_arch_update_irqfd_routing()`
-or `__kvm_riscv_vcpu_irq_update()` on PREEMPT_RT kernels.
+- Holds `vsfile_lock(read)` around `irq_set_vcpu_affinity()` and
+  `irq_write_msi_msg()` to ensure `imsic->vsfile_pa` is stable.
 
-### kvm_riscv_vcpu_irq_update()
+- After a successful `irq_set_vcpu_affinity()`, calls
+  `irq_data_get_irq_chip(irqdata)->irq_write_msi_msg(irqdata, &msg)` directly
+  (not via `irq_write_msi_msg()`). This reprograms the device MSI target
+  address to point at the guest VS-file GPA directly.
+
+  **RISC-V-specific design**: unlike x86 (updates IRTE) and arm64 (updates
+  ITS ITTE), RISC-V reprograms the device MSI target to the guest IMSIC GPA.
+  The device writes to the guest GPA; the IOMMU MSI table maps guest GPA →
+  host VS-file HPA. If the device were left targeting the host IMSIC physical
+  address, the IOMMU would not intercept the write. This departure from x86/arm64
+  must be documented at the call site.
+
+- Any lock acquired inside must be lower in the hierarchy than `irqfds.lock`.
+
+### kvm_riscv_vcpu_irq_update() / __kvm_riscv_vcpu_irq_update()
 
 Called from `kvm_riscv_vcpu_aia_imsic_update()` **after**
 `write_unlock_irqrestore(&imsic->vsfile_lock)`. This is the fix for the
@@ -191,14 +238,15 @@ which conflicted with `kvm_irqfd_update()` holding `irqfds.lock` then
 acquiring `vsfile_lock(read)`.
 
 - Acquires `irqfds.lock` internally to iterate `kvm->irqfds.items`.
-- Breaks on any non-zero return from `irq_set_vcpu_affinity()`, with
-  `WARN_ON_ONCE` for non-EOPNOTSUPP errors.
+- Lock ordering comment in code: `irqfds.lock -> vsfile_lock(read)` — same
+  order as `kvm_arch_update_irqfd_routing()`.
+- Filters to irqfds whose MSI target matches the given vCPU's `imsic_addr`
+  (not all irqfds in the VM).
 
-**REPORT as bugs**: `__kvm_riscv_vcpu_irq_update()` breaking out of the
-irqfd loop on the first failure.  After a vCPU migration, if one device's
-`irq_set_vcpu_affinity()` fails, the remaining irqfds in the VM still point
-to the old VS-file.  The loop should continue and log each failure rather than
-aborting early.
+**OPEN**: Breaks on the first `irq_set_vcpu_affinity()` failure (`if (ret) break`).
+After a vCPU migration, if one device's `irq_set_vcpu_affinity()` fails, the
+remaining irqfds in the VM still point to the old VS-file. The loop should
+continue and log each failure rather than aborting early.
 
 **REPORT as bugs**: any code path that acquires `irqfds.lock` while holding
 `vsfile_lock`, or acquires `vsfile_lock` while holding `irqfds.lock`.
@@ -211,48 +259,18 @@ Defined in `include/linux/irqchip/riscv-imsic.h`. Fields:
 - `msi_addr_mask`, `msi_addr_pattern` — IMSIC address filter
 - `group_index_bits`, `group_index_shift` — IMSIC topology parameters
 
-**Resolved**: Moved to `include/linux/irqchip/riscv-imsic.h` in rc3.
-
-## IMSIC Identity Mappings in the S-Stage Table
-
-IMSIC addresses must be identity-mapped in the **s-stage** so the IOMMU
-can match them against `msi_addr_pattern`/`msi_addr_mask` and redirect them
-to the MSI table. Without s-stage mappings the s-stage translation faults
-before the MSI table is ever consulted.
-
-`riscv_iommu_ir_map_unmap_imsics()` calls `iommu_map(&domain->domain,
-addr, addr, ...)` — this maps into the s-stage (`domain->domain`), not the
-g-stage. The g-stage identity mappings for DMA are installed automatically
-by the `gstage_install_ops()` wrapper on every `iommu_map()` call; IMSIC
-addresses are handled separately via this explicit s-stage map.
-
-**REPORT as bugs**: code that calls `riscv_iommu_gstage_map()` for IMSIC
-addresses — that would map into the g-stage and have no effect on MSI
-lookup.
-
-## Open Issues in v3-rc4
-
-- **PREEMPT_RT: `iommu_map()` in spinlock context**: `kvm_arch_update_irqfd_routing()`
-  and `__kvm_riscv_vcpu_irq_update()` call `irq_set_vcpu_affinity()` which on
-  topology change calls `iommu_map()` while `irqfds.lock` is held with
-  `spin_lock_irq` (IRQs disabled).  On PREEMPT_RT, `iommu_map()` acquires
-  sleeping locks.  Needs a fallback for the new-topology path.
-
-- **NULL-deref in `riscv_iommu_ir_irq_domain_alloc_irqs()`**: `info->domain`
-  is accessed without a null-check.  `info->domain` is NULL from probe until
-  first domain attach.  If IRQ allocation somehow occurs before domain attach
-  the driver crashes.  Add a guard: `if (!info->domain) return -ENODEV`.
+## Open Issues in v3-rc5
 
 - **irqfd loop breaks on first failure**: `__kvm_riscv_vcpu_irq_update()`
   breaks on the first `irq_set_vcpu_affinity()` failure, leaving remaining
-  devices with stale PTE entries after vCPU migration.  The loop should
+  devices with stale PTE entries after vCPU migration. The loop should
   continue and log each failure.
 
 - **`irqfds.lock` in add_producer**: `kvm_arch_irq_bypass_add_producer()`
   assigns `irqfd->producer` and calls `kvm_arch_update_irqfd_routing()`
   without holding `irqfds.lock`. The specific complication is that
-  `kvm_riscv_vcpu_irq_update()` acquires `irqfds.lock` internally, so it
-  cannot be called while the lock is held.  See `irqbypass.md` for the
+  `__kvm_riscv_vcpu_irq_update()` acquires `irqfds.lock` internally, so it
+  cannot be called while the lock is held. See `irqbypass.md` for the
   general constraint.
 
 - **`stop`/`start` callbacks**: not implemented; weak no-ops used.  The
@@ -265,38 +283,53 @@ lookup.
   needs a comment explaining that `imsic_addr` is set once at AIA device
   configuration time and never changes.
 
+- **NULL-deref in `riscv_iommu_ir_irq_domain_alloc_irqs()`**: `info->domain`
+  is accessed without a null-check. If IRQ allocation somehow occurs before
+  domain attach the driver will crash on `riscv_iommu_ir_compute_msipte_idx()`
+  dereferencing `domain->group_index_bits`. Add a guard: `if (!domain) return -ENODEV`.
+
+- **PREEMPT_RT topology-change path**: `riscv_iommu_ir_vcpu_new_config()`
+  calls `riscv_iommu_ir_msiptp_update()` → `riscv_iommu_iodir_update()`.
+  If `riscv_iommu_iodir_update()` acquires any `spinlock_t` internally, this
+  is an RT violation when called from `kvm_arch_update_irqfd_routing()` under
+  `irqfds.lock` (IRQs disabled). Verify the call chain is RT-safe.
+
 ## Design Notes
+
+### irq_write_msi_msg() via chip interface
+
+In rc5, `kvm_arch_update_irqfd_routing()` calls
+`irq_data_get_irq_chip(irqdata)->irq_write_msi_msg(irqdata, &msg)` directly
+instead of the `irq_write_msi_msg()` wrapper. This bypasses the intermediate
+domain translation steps and writes the MSI message directly via the chip.
+The rationale is the same as before: reprogram the device to target the guest
+IMSIC GPA so that subsequent MSI writes are intercepted by the IOMMU MSI
+table.
 
 ### irq_write_msi_msg() in kvm_arch_update_irqfd_routing()
 
 Unlike x86 (which updates the IRTE and never touches the device MSI message)
 and arm64 (which updates the ITS ITTE and never touches the device MSI
-message), the RISC-V implementation calls `irq_write_msi_msg()` from
-`kvm_arch_update_irqfd_routing()` to reprogram the device MSI target address
-to point at the guest VS-file GPA directly.
+message), the RISC-V implementation calls the chip's `irq_write_msi_msg`
+from `kvm_arch_update_irqfd_routing()` to reprogram the device MSI target
+address to point at the guest VS-file GPA directly.
 
 This is intentional: the device targets the guest IMSIC GPA; the IOMMU MSI
 table maps guest GPA → host VS-file HPA. The device must be programmed with
 the guest GPA so that its MSI writes match `msi_addr_pattern`/`msi_addr_mask`
-and are intercepted by the IOMMU MSI table. If the device were left
-programmed with the host IMSIC physical address (as x86/arm64 leave devices
-programmed with the host IRTE/ITS address), the IOMMU would not intercept
-the write and the MSI would be delivered to the host IMSIC instead of the
-guest VS-file.
-
-This design requires a comment at the call site explaining the departure from
-x86/arm64 behaviour.
+and are intercepted by the IOMMU MSI table. This design requires a comment at
+the call site explaining the departure from x86/arm64 behaviour.
 
 ## Quick Checks
 
-- **`msi_root` NULL check is not a capability guard**: checking
-  `domain->msi_root` before populating a local `dc` struct prevents non-zero
-  MSI values, but does not prevent `riscv_iommu_iodir_update()` from writing
-  zero values to hardware. A separate `MSI_FLAT` capability check is needed
-  in the update function itself.
+- **`msi_root` NULL check is not a capability guard**: `riscv_iommu_ir_msitbl_map()`
+  returns early when `domain->msi_root == NULL` (e.g., base-format hardware).
+  This prevents PTE writes but does not prevent `riscv_iommu_iodir_update()`
+  from writing zero values to hardware. A separate `MSI_FLAT` capability check
+  is needed in the update function itself.
 - **`raw_spinlock_t msi_lock`**: `irq_set_vcpu_affinity()` runs in atomic
   context (called from KVM with IRQs disabled). Using `spinlock_t` here
-  would deadlock.
+  would deadlock on PREEMPT_RT.
 - **`imsic_get_global_config()` NULL check**: on systems without IMSIC the
   pointer is NULL and no IR domain is created. All callers must handle NULL.
 - **`msitbl_config` generation counter**: stale IRQs from a previous config
@@ -304,4 +337,7 @@ x86/arm64 behaviour.
   config-change path. Only IRQs whose stored config matches the current
   `domain->msitbl_config` need `riscv_iommu_ir_msitbl_unmap()`.
 - **`struct riscv_iommu_ir_vcpu_info` location**: defined in
-  `include/linux/irqchip/riscv-imsic.h`. ✓ Resolved in rc3.
+  `include/linux/irqchip/riscv-imsic.h`. ✓
+- **`guard(raw_spinlock)` not `irqsave`**: `riscv_iommu_ir_irq_set_vcpu_affinity()`
+  uses `guard(raw_spinlock)` (not irqsave) because the caller (`kvm_arch_update_irqfd_routing()`)
+  already runs with IRQs disabled via `spin_lock_irq(&irqfds.lock)`.
