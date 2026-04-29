@@ -194,6 +194,15 @@ Implemented in rc5. Calls
 clearing `irqfd->producer = NULL`. This ensures the IOMMU MSI table entry
 is removed before the producer reference is dropped.
 
+The irqbypass framework calls `producer->stop()` **before**
+`consumer->del_producer()` (see `virt/lib/irqbypass.c: __disconnect()`),
+so the device is quiesced when `irq_set_vcpu_affinity(NULL)` runs —
+no in-flight MSIs reach the IOMMU during the unmap. There is no need to
+reprogram the device MSI target address back to the host IMSIC HPA here;
+the irqbypass `start()` callbacks and, if the device is fully unbound from
+VFIO, the e1000e reprobe re-run `irq_write_msi_msg` with the correct host
+IMSIC address.
+
 ### kvm_arch_update_irqfd_routing()
 
 - Called from both `kvm_arch_irq_bypass_add_producer()` (not under
@@ -293,6 +302,29 @@ Defined in `include/linux/irqchip/riscv-imsic.h`. Fields:
   If `riscv_iommu_iodir_update()` acquires any `spinlock_t` internally, this
   is an RT violation when called from `kvm_arch_update_irqfd_routing()` under
   `irqfds.lock` (IRQs disabled). Verify the call chain is RT-safe.
+
+- **TC3 IOMMU faults (QEMU only)**: QEMU testing of two e1000e devices in one
+  guest produces 4 deterministic IOMMU faults per iteration. The fault record
+  decodes as `CAUSE=23` (`RISCV_IOMMU_FQ_CAUSE_WR_FAULT_VS` — write
+  guest-virtual page fault), `IOVA=0x8001000`. This is **not** an MSI-table
+  fault; it means the IOMMU routed the write through the G-stage DMA path
+  instead of the MSI path, implying the DC's `msi_addr_pattern/mask` did not
+  match the IOVA at that instant.
+
+  The `IOTINVAL.GVMA` usage in the fast path and `vcpu_new_config` path was
+  verified against `iommu_sw_guidelines.adoc`: a targeted invalidation
+  (`GV=AV=1, ADDR=GPA, GSCID=DC.iohgatp.GSCID`) is the spec-prescribed
+  method for flushing a single MSI PTE cache entry; the broadcast form
+  (`GV=1, AV=0`) invalidates all entries for a GSCID. The driver issues
+  both forms correctly.
+
+  The faults correlate with `IOTINVAL.GVMA + IOFENCE` sequences during vCPU
+  migration (HPA update to MSI table PTE). The most likely cause is a QEMU
+  RISC-V IOMMU emulation defect where the emulator briefly consults a stale
+  DC entry during IOTINVAL processing and fails to recognise the IOVA as an
+  MSI address. Functionally benign (e1000e retries) and not reproduced on
+  real hardware. Do not raise as a kernel driver bug without first
+  confirming on real hardware.
 
 ## Design Notes
 

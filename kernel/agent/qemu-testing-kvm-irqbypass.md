@@ -472,6 +472,31 @@ def analyze_qemu_trace(trace_log, min_gscids=1):
     return passed, results
 ```
 
+### TC2 trace pattern — identity translations before guest irqbypass connects
+
+In multi-iteration VFIO rebind tests (TC2), the trace will show a flood of
+identity DMA translations (`0x28020000 -> 0x28020000` etc.) followed by a
+small number of MSI translations (`0x8001000 -> 0x28019000`) near the end of
+each guest session. This is expected:
+
+- **Identity translations**: after VFIO unbind + e1000e rebind, the IOMMU
+  domain is torn down (`riscv_iommu_ir_free_paging_domain()` zeroes
+  `msi_addr_mask`) and re-initialised with the HOST IMSIC config on the
+  next attach. The e1000e writes MSIs to the host IMSIC HPA (e.g.,
+  `0x28020000`); the IOMMU matches the host `msi_addr_pattern` and
+  translates identity. This is normal host-delivery mode.
+
+- **Guest MSI translations at the end**: when irqbypass connects (after the
+  KVM guest boots and AIA is initialised), `kvm_arch_update_irqfd_routing()`
+  triggers `vcpu_new_config()` (host config → guest config mismatch),
+  reprograms the DC with the guest IMSIC `msi_addr_pattern/mask`, and calls
+  `irq_write_msi_msg` to reprogram the device to write to the guest GPA.
+  Only MSIs sent after this point appear as guest translations. If the guest
+  runs a short test, only a few guest MSI translations appear.
+
+Do not flag the identity translations as a failure in TC2. They are the
+expected state between VFIO cycles and before irqbypass is established.
+
 ## MSI-X Verification
 
 For devices where ping is unreliable (slirp limitation), verify irqbypass
@@ -777,6 +802,16 @@ Two independent IOMMU domains, MSI tables, and irqbypass paths.
 
 **Pass criteria**: both devices MSI-X active, eth1 ping best-effort,
 QEMU trace: 0 faults, MSI for both BDFs, >=2 distinct GSCIDs.
+
+**Known QEMU artifact — WR_FAULT_VS faults**: QEMU testing produces 4
+deterministic IOMMU faults per iteration (`CAUSE=23`, `IOVA=0x8001000`,
+`WR_FAULT_VS`). These occur in tight bursts around `IOTINVAL.GVMA+IOFENCE`
+sequences during vCPU migration, and are a QEMU RISC-V IOMMU emulation
+artifact. The kernel driver's `IOTINVAL.GVMA` usage is spec-compliant
+(verified against `iommu_sw_guidelines.adoc`). Do not fail TC3 on these
+faults in QEMU testing; log them separately and note they are not reproduced
+on real hardware. See the **TC3 IOMMU faults (QEMU only)** entry in
+`riscv-irqbypass.md` for the full analysis.
 
 ### TC4 — One e1000e per guest, two simultaneous guests (3 iterations)
 
